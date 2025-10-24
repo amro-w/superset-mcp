@@ -57,9 +57,7 @@ load_dotenv()
 
 # Constants
 SUPERSET_BASE_URL = os.getenv("SUPERSET_BASE_URL", "http://localhost:8088")
-SUPERSET_USERNAME = os.getenv("SUPERSET_USERNAME")
-SUPERSET_PASSWORD = os.getenv("SUPERSET_PASSWORD")
-ACCESS_TOKEN_STORE_PATH = os.path.join(os.path.dirname(__file__), ".superset_token")
+SESSION_COOKIE_STORE_PATH = os.path.join(os.path.dirname(__file__), ".superset_session")
 
 # Initialize FastAPI app for handling additional web endpoints if needed
 app = FastAPI(title="Superset MCP Server")
@@ -71,29 +69,29 @@ class SupersetContext:
 
     client: httpx.AsyncClient
     base_url: str
-    access_token: Optional[str] = None
+    session_cookie: Optional[str] = None
     csrf_token: Optional[str] = None
     app: FastAPI = None
 
 
-def load_stored_token() -> Optional[str]:
-    """Load stored access token if it exists"""
+def load_stored_session_cookie() -> Optional[str]:
+    """Load stored session cookie if it exists"""
     try:
-        if os.path.exists(ACCESS_TOKEN_STORE_PATH):
-            with open(ACCESS_TOKEN_STORE_PATH, "r") as f:
+        if os.path.exists(SESSION_COOKIE_STORE_PATH):
+            with open(SESSION_COOKIE_STORE_PATH, "r") as f:
                 return f.read().strip()
     except Exception:
         return None
     return None
 
 
-def save_access_token(token: str):
-    """Save access token to file"""
+def save_session_cookie(cookie: str):
+    """Save session cookie to file"""
     try:
-        with open(ACCESS_TOKEN_STORE_PATH, "w") as f:
-            f.write(token)
+        with open(SESSION_COOKIE_STORE_PATH, "w") as f:
+            f.write(cookie)
     except Exception as e:
-        logger.warning(f"Warning: Could not save access token: {e}")
+        logger.warning(f"Warning: Could not save session cookie: {e}")
 
 
 @asynccontextmanager
@@ -107,27 +105,29 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
     # Create context
     ctx = SupersetContext(client=client, base_url=SUPERSET_BASE_URL, app=app)
 
-    # Try to load existing token
-    stored_token = load_stored_token()
-    if stored_token:
-        ctx.access_token = stored_token
-        # Set the token in the client headers
-        client.headers.update({"Authorization": f"Bearer {stored_token}"})
-        logger.info("Using stored access token")
+    # Try to load existing session cookie
+    stored_session = load_stored_session_cookie()
+    if stored_session:
+        ctx.session_cookie = stored_session
+        # Set the session cookie
+        client.cookies.set("session", stored_session)
+        logger.info("Using stored session cookie")
 
-        # Verify token validity
+        # Verify cookie validity
         try:
             response = await client.get("/api/v1/me/")
             if response.status_code != 200:
                 logger.info(
-                    f"Stored token is invalid (status {response.status_code}). Will need to re-authenticate."
+                    f"Stored session cookie is invalid (status {response.status_code}). Will need to re-authenticate."
                 )
-                ctx.access_token = None
-                client.headers.pop("Authorization", None)
+                ctx.session_cookie = None
+                client.cookies.clear()
+            else:
+                logger.info("Session cookie is valid")
         except Exception as e:
-            logger.info(f"Error verifying stored token: {e}")
-            ctx.access_token = None
-            client.headers.pop("Authorization", None)
+            logger.info(f"Error verifying stored session cookie: {e}")
+            ctx.session_cookie = None
+            client.cookies.clear()
 
     try:
         yield ctx
@@ -160,8 +160,8 @@ def requires_auth(
     async def wrapper(ctx: Context, *args, **kwargs) -> Dict[str, Any]:
         superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
-        if not superset_ctx.access_token:
-            return {"error": "Not authenticated. Please authenticate first."}
+        if not superset_ctx.session_cookie:
+            return {"error": "Not authenticated. Please set session cookie first using superset_auth_set_session_cookie."}
 
         return await func(ctx, *args, **kwargs)
 
@@ -189,11 +189,10 @@ async def with_auto_refresh(
     ctx: Context, api_call: Callable[[], Awaitable[httpx.Response]]
 ) -> httpx.Response:
     """
-    Helper function to handle automatic token refreshing for API calls
+    Helper function to execute API calls (no auto-refresh with cookie auth)
 
-    This function will attempt to execute the provided API call. If the call
-    fails with a 401 Unauthorized error, it will try to refresh the token
-    and retry the API call once.
+    With cookie-based authentication, there is no automatic token refresh.
+    If the session expires, the user must provide a new session cookie.
 
     Args:
         ctx: The MCP context
@@ -201,42 +200,24 @@ async def with_auto_refresh(
     """
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
-    if not superset_ctx.access_token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not superset_ctx.session_cookie:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please set session cookie.")
 
-    # First attempt
-    try:
-        response = await api_call()
+    # Execute the API call
+    response = await api_call()
 
-        # If not an auth error, return the response
-        if response.status_code != 401:
-            return response
-
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code != 401:
-            raise e
-        response = e.response
-    except Exception as e:
-        # For other errors, just raise
-        raise e
-
-    # If we got a 401, try to refresh the token
-    logger.info("Received 401 Unauthorized. Attempting to refresh token...")
-    refresh_result = await superset_auth_refresh_token(ctx)
-
-    if refresh_result.get("error"):
-        # If refresh failed, try to re-authenticate
-        logger.info(
-            f"Token refresh failed: {refresh_result.get('error')}. Attempting re-authentication..."
+    # If we get a 401, the session has expired
+    if response.status_code == 401:
+        logger.info("Received 401 Unauthorized. Session cookie may have expired.")
+        # Clear the expired cookie
+        superset_ctx.session_cookie = None
+        superset_ctx.client.cookies.clear()
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired. Please set a new session cookie using superset_auth_set_session_cookie."
         )
-        auth_result = await superset_auth_authenticate_user(ctx)
 
-        if auth_result.get("error"):
-            # If re-authentication failed, raise an exception
-            raise HTTPException(status_code=401, detail="Authentication failed")
-
-    # Retry the API call with the new token
-    return await api_call()
+    return response
 
 
 async def get_csrf_token(ctx: Context) -> Optional[str]:
@@ -301,6 +282,10 @@ async def make_api_request(
         if method.lower() != "get" and superset_ctx.csrf_token:
             headers["X-CSRFToken"] = superset_ctx.csrf_token
 
+        # Add Referer header for non-GET requests (required by Superset's CSRF protection)
+        if method.lower() != "get":
+            headers["Referer"] = superset_ctx.base_url + "/"
+
         if method.lower() == "get":
             return await client.get(endpoint, params=params)
         elif method.lower() == "post":
@@ -334,170 +319,64 @@ async def make_api_request(
 
 @mcp.tool()
 @handle_api_errors
-async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
-    """
-    Check if the current access token is still valid
-
-    Makes a request to the /api/v1/me/ endpoint to test if the current token is valid.
-    Use this to verify authentication status before making other API calls.
-
-    Returns:
-        A dictionary with token validity status and any error information
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"valid": False, "error": "No access token available"}
-
-    try:
-        # Make a simple API call to test if token is valid (get user info)
-        response = await superset_ctx.client.get("/api/v1/me/")
-
-        if response.status_code == 200:
-            return {"valid": True}
-        else:
-            return {
-                "valid": False,
-                "status_code": response.status_code,
-                "error": response.text,
-            }
-    except Exception as e:
-        return {"valid": False, "error": str(e)}
-
-
-@mcp.tool()
-@handle_api_errors
-async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
-    """
-    Refresh the access token using the refresh endpoint
-
-    Makes a request to the /api/v1/security/refresh endpoint to get a new access token
-    without requiring re-authentication with username/password.
-
-    Returns:
-        A dictionary with the new access token or error information
-    """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
-
-    if not superset_ctx.access_token:
-        return {"error": "No access token to refresh. Please authenticate first."}
-
-    try:
-        # Use the refresh endpoint to get a new token
-        response = await superset_ctx.client.post("/api/v1/security/refresh")
-
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to refresh token: {response.status_code} - {response.text}"
-            }
-
-        data = response.json()
-        access_token = data.get("access_token")
-
-        if not access_token:
-            return {"error": "No access token returned from refresh"}
-
-        # Save and set the new access token
-        save_access_token(access_token)
-        superset_ctx.access_token = access_token
-        superset_ctx.client.headers.update({"Authorization": f"Bearer {access_token}"})
-
-        return {
-            "message": "Successfully refreshed access token",
-            "access_token": access_token,
-        }
-    except Exception as e:
-        return {"error": f"Error refreshing token: {str(e)}"}
-
-
-@mcp.tool()
-@handle_api_errors
-async def superset_auth_authenticate_user(
-    ctx: Context,
-    username: Optional[str] = None,
-    password: Optional[str] = None,
-    refresh: bool = True,
+async def superset_auth_set_session_cookie(
+    ctx: Context, session_cookie: str
 ) -> Dict[str, Any]:
     """
-    Authenticate with Superset and get access token
+    Set the Superset session cookie for authentication
 
-    Makes a request to the /api/v1/security/login endpoint to authenticate and obtain an access token.
-    If there's an existing token, will first try to check its validity.
-    If invalid, will attempt to refresh token before falling back to re-authentication.
+    Use this tool to authenticate with Superset using a session cookie obtained from your browser.
+    The cookie will be stored and used for all subsequent API requests.
+
+    To get your session cookie:
+    1. Log into Superset in your browser
+    2. Open browser DevTools (F12)
+    3. Go to Application/Storage -> Cookies
+    4. Find the 'session' cookie value
+    5. Copy the entire cookie value and pass it to this tool
 
     Args:
-        username: Superset username (falls back to environment variable if not provided)
-        password: Superset password (falls back to environment variable if not provided)
-        refresh: Whether to refresh the token if invalid (defaults to True)
+        session_cookie: The session cookie value from your browser
 
     Returns:
-        A dictionary with authentication status and access token or error information
+        A dictionary with authentication status
     """
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
-    # If we already have a token, check if it's valid
-    if superset_ctx.access_token:
-        validity = await superset_auth_check_token_validity(ctx)
-
-        if validity.get("valid"):
-            return {
-                "message": "Already authenticated with valid token",
-                "access_token": superset_ctx.access_token,
-            }
-
-        # Token invalid, try to refresh if requested
-        if refresh:
-            refresh_result = await superset_auth_refresh_token(ctx)
-            if not refresh_result.get("error"):
-                return refresh_result
-            # If refresh fails, fall back to re-authentication
-
-    # Use provided credentials or fall back to env vars
-    username = username or SUPERSET_USERNAME
-    password = password or SUPERSET_PASSWORD
-
-    if not username or not password:
-        return {
-            "error": "Username and password must be provided either as arguments or set in environment variables"
-        }
-
     try:
-        # Get access token directly using the security login API endpoint
-        response = await superset_ctx.client.post(
-            "/api/v1/security/login",
-            json={
-                "username": username,
-                "password": password,
-                "provider": "db",
-                "refresh": refresh,
-            },
-        )
+        # Set the session cookie
+        superset_ctx.session_cookie = session_cookie
+        superset_ctx.client.cookies.set("session", session_cookie)
+
+        # Verify the cookie works
+        response = await superset_ctx.client.get("/api/v1/me/")
 
         if response.status_code != 200:
+            # Clear the invalid cookie
+            superset_ctx.session_cookie = None
+            superset_ctx.client.cookies.clear()
             return {
-                "error": f"Failed to get access token: {response.status_code} - {response.text}"
+                "error": f"Invalid session cookie: {response.status_code} - {response.text}"
             }
 
-        data = response.json()
-        access_token = data.get("access_token")
-
-        if not access_token:
-            return {"error": "No access token returned"}
-
-        # Save and set the access token
-        save_access_token(access_token)
-        superset_ctx.access_token = access_token
-        superset_ctx.client.headers.update({"Authorization": f"Bearer {access_token}"})
+        # Save the cookie for future use
+        save_session_cookie(session_cookie)
 
         # Get CSRF token after successful authentication
         await get_csrf_token(ctx)
 
+        user_data = response.json()
         return {
-            "message": "Successfully authenticated with Superset",
-            "access_token": access_token,
+            "message": "Successfully authenticated with session cookie",
+            "username": user_data.get("result", {}).get("username"),
+            "first_name": user_data.get("result", {}).get("first_name"),
+            "last_name": user_data.get("result", {}).get("last_name"),
         }
 
     except Exception as e:
+        # Clear the cookie on error
+        superset_ctx.session_cookie = None
+        superset_ctx.client.cookies.clear()
         return {"error": f"Authentication error: {str(e)}"}
 
 
