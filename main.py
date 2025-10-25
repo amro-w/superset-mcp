@@ -314,6 +314,62 @@ async def make_api_request(
     return response.json()
 
 
+def _filter_response_fields(
+    response: Dict[str, Any], fields_to_keep: List[str]
+) -> Dict[str, Any]:
+    """
+    Filter API response to keep only specified fields in result items
+
+    Args:
+        response: Full API response with 'result' array
+        fields_to_keep: List of field paths to keep (e.g., ['id', 'name', 'owner.username'])
+
+    Returns:
+        Filtered response with same structure but reduced fields
+    """
+    if not isinstance(response, dict) or "result" not in response:
+        return response
+
+    def get_nested_value(obj: Any, path: str) -> Any:
+        """Get nested value using dot notation, returns None if path doesn't exist"""
+        keys = path.split(".")
+        current = obj
+        for key in keys:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return None
+        return current
+
+    def set_nested_value(obj: dict, path: str, value: Any):
+        """Set nested value using dot notation"""
+        keys = path.split(".")
+        current = obj
+        for key in keys[:-1]:
+            if key not in current:
+                current[key] = {}
+            current = current[key]
+        current[keys[-1]] = value
+
+    filtered_results = []
+    for item in response.get("result", []):
+        filtered_item = {}
+        for field_path in fields_to_keep:
+            value = get_nested_value(item, field_path)
+            if value is not None:
+                set_nested_value(filtered_item, field_path, value)
+        filtered_results.append(filtered_item)
+
+    # Preserve top-level response structure
+    filtered_response = {
+        "count": response.get("count"),
+        "ids": response.get("ids"),
+        "result": filtered_results,
+    }
+
+    return filtered_response
+
+
 # ===== Authentication Tools =====
 
 
@@ -386,17 +442,73 @@ async def superset_auth_set_session_cookie(
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
+async def superset_dashboard_list(
+    ctx: Context,
+    search: str,
+    owner_id: int = None,
+    created_after: str = None,
+    created_before: str = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
     """
     Get a list of dashboards from Superset
 
-    Makes a request to the /api/v1/dashboard/ endpoint to retrieve all dashboards
-    the current user has access to view. Results are paginated.
+    Makes a request to the /api/v1/dashboard/ endpoint to retrieve dashboards
+    the current user has access to view. Results are paginated and filtered.
+
+    Args:
+        search: Search term to filter dashboards by title/description (required, use empty string for no search)
+        owner_id: Optional user ID to filter dashboards by owner
+        created_after: Optional ISO date string to filter dashboards created after this date (e.g., "2025-01-01")
+        created_before: Optional ISO date string to filter dashboards created before this date (e.g., "2025-12-31")
+        verbose: If False (default), return only essential fields (id, title, url, owners, charts).
+                 If True, return all fields from API.
 
     Returns:
         A dictionary containing dashboard data including id, title, url, and metadata
     """
-    return await make_api_request(ctx, "get", "/api/v1/dashboard/")
+    params = {}
+
+    # Build filter query
+    filters = []
+
+    # Add search filter if provided and not empty
+    if search:
+        filters.append({"col": "dashboard_title", "opr": "ct", "value": search})
+
+    # Add owner filter if provided
+    if owner_id is not None:
+        filters.append({"col": "owners", "opr": "rel_m_m", "value": owner_id})
+
+    # Add date filters if provided
+    if created_after:
+        filters.append({"col": "created_on", "opr": "gt", "value": created_after})
+
+    if created_before:
+        filters.append({"col": "created_on", "opr": "lt", "value": created_before})
+
+    # Build the query parameter in Superset's format
+    if filters:
+        import json
+        params["q"] = json.dumps({"filters": filters})
+
+    response = await make_api_request(ctx, "get", "/api/v1/dashboard/", params=params)
+
+    # Filter response if verbose=False
+    if not verbose and "result" in response:
+        response = _filter_response_fields(
+            response,
+            [
+                "id",
+                "dashboard_title",
+                "url",
+                "slug",
+                "owners",
+                "charts",
+            ],
+        )
+
+    return response
 
 
 @mcp.tool()
@@ -503,17 +615,37 @@ async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_chart_list(ctx: Context) -> Dict[str, Any]:
+async def superset_chart_list(ctx: Context, verbose: bool = False) -> Dict[str, Any]:
     """
     Get a list of charts from Superset
 
     Makes a request to the /api/v1/chart/ endpoint to retrieve all charts
     the current user has access to view. Results are paginated.
 
+    Args:
+        verbose: If False (default), return only essential fields (id, slice_name, viz_type, datasource info).
+                 If True, return all fields from API.
+
     Returns:
         A dictionary containing chart data including id, slice_name, viz_type, and datasource info
     """
-    return await make_api_request(ctx, "get", "/api/v1/chart/")
+    response = await make_api_request(ctx, "get", "/api/v1/chart/")
+
+    # Filter response if verbose=False
+    if not verbose and "result" in response:
+        response = _filter_response_fields(
+            response,
+            [
+                "id",
+                "slice_name",
+                "viz_type",
+                "datasource_id",
+                "datasource_name",
+                "datasource_type",
+            ],
+        )
+
+    return response
 
 
 @mcp.tool()
@@ -624,17 +756,36 @@ async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_database_list(ctx: Context) -> Dict[str, Any]:
+async def superset_database_list(ctx: Context, verbose: bool = False) -> Dict[str, Any]:
     """
     Get a list of databases from Superset
 
     Makes a request to the /api/v1/database/ endpoint to retrieve all database
     connections the current user has access to. Results are paginated.
 
+    Args:
+        verbose: If False (default), return only essential fields (id, database_name, backend, expose_in_sqllab).
+                 If True, return all fields from API.
+
     Returns:
         A dictionary containing database connection information including id, name, and configuration
     """
-    return await make_api_request(ctx, "get", "/api/v1/database/")
+    response = await make_api_request(ctx, "get", "/api/v1/database/")
+
+    # Filter response if verbose=False
+    if not verbose and "result" in response:
+        response = _filter_response_fields(
+            response,
+            [
+                "id",
+                "database_name",
+                "backend",
+                "allow_run_async",
+                "expose_in_sqllab",
+            ],
+        )
+
+    return response
 
 
 @mcp.tool()
@@ -970,17 +1121,36 @@ async def superset_database_validate_parameters(
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_dataset_list(ctx: Context) -> Dict[str, Any]:
+async def superset_dataset_list(ctx: Context, verbose: bool = False) -> Dict[str, Any]:
     """
     Get a list of datasets from Superset
 
     Makes a request to the /api/v1/dataset/ endpoint to retrieve all datasets
     the current user has access to view. Results are paginated.
 
+    Args:
+        verbose: If False (default), return only essential fields (id, table_name, schema, database, owners).
+                 If True, return all fields from API.
+
     Returns:
         A dictionary containing dataset information including id, table_name, and database
     """
-    return await make_api_request(ctx, "get", "/api/v1/dataset/")
+    response = await make_api_request(ctx, "get", "/api/v1/dataset/")
+
+    # Filter response if verbose=False
+    if not verbose and "result" in response:
+        response = _filter_response_fields(
+            response,
+            [
+                "id",
+                "table_name",
+                "schema",
+                "database",
+                "owners",
+            ],
+        )
+
+    return response
 
 
 @mcp.tool()
@@ -1083,17 +1253,44 @@ async def superset_sqllab_execute_query(
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_sqllab_get_saved_queries(ctx: Context) -> Dict[str, Any]:
+async def superset_sqllab_get_saved_queries(
+    ctx: Context, verbose: bool = False
+) -> Dict[str, Any]:
     """
     Get a list of saved queries from SQL Lab
 
     Makes a request to the /api/v1/saved_query/ endpoint to retrieve all saved queries
     the current user has access to. Results are paginated.
 
+    Args:
+        verbose: If False (default), return only essential fields with truncated SQL.
+                 If True, return all fields from API.
+
     Returns:
         A dictionary containing saved query information including id, label, and database
     """
-    return await make_api_request(ctx, "get", "/api/v1/saved_query/")
+    response = await make_api_request(ctx, "get", "/api/v1/saved_query/")
+
+    # Filter response if verbose=False
+    if not verbose and "result" in response:
+        # First filter fields
+        response = _filter_response_fields(
+            response,
+            [
+                "id",
+                "label",
+                "description",
+                "sql",
+                "database",
+            ],
+        )
+
+        # Then truncate SQL fields
+        for item in response.get("result", []):
+            if "sql" in item and item["sql"] and len(item["sql"]) > 200:
+                item["sql"] = item["sql"][:200] + "..."
+
+    return response
 
 
 @mcp.tool()
@@ -1294,17 +1491,43 @@ async def superset_query_stop(ctx: Context, client_id: str) -> Dict[str, Any]:
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_query_list(ctx: Context) -> Dict[str, Any]:
+async def superset_query_list(ctx: Context, verbose: bool = False) -> Dict[str, Any]:
     """
     Get a list of queries from Superset
 
     Makes a request to the /api/v1/query/ endpoint to retrieve query history.
     Results are paginated and include both finished and running queries.
 
+    Args:
+        verbose: If False (default), return only essential fields with truncated SQL.
+                 If True, return all fields from API.
+
     Returns:
         A dictionary containing query information including status, duration, and SQL
     """
-    return await make_api_request(ctx, "get", "/api/v1/query/")
+    response = await make_api_request(ctx, "get", "/api/v1/query/")
+
+    # Filter response if verbose=False
+    if not verbose and "result" in response:
+        # First filter fields
+        response = _filter_response_fields(
+            response,
+            [
+                "id",
+                "sql",
+                "status",
+                "start_time",
+                "end_time",
+                "database",
+            ],
+        )
+
+        # Then truncate SQL fields
+        for item in response.get("result", []):
+            if "sql" in item and item["sql"] and len(item["sql"]) > 200:
+                item["sql"] = item["sql"][:200] + "..."
+
+    return response
 
 
 @mcp.tool()

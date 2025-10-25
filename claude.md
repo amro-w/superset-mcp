@@ -151,4 +151,105 @@ Should return charts array populated instead of empty: `"charts": ["Chart Name 1
 
 ---
 
+## List Endpoints and the Verbose Parameter
+
+### Problem
+List endpoints (dashboards, charts, datasets, etc.) can return extremely large responses when dealing with hundreds or thousands of items. This causes:
+- Token limit issues for LLMs
+- Slow response times
+- Unnecessary data transfer
+
+### Solution: Verbose Parameter
+All list endpoints now support a `verbose` parameter (default: `False`):
+
+```python
+# Compact response (default) - only essential fields
+superset_dashboard_list(search="", verbose=False)  # or omit verbose parameter
+
+# Full response - all fields from API
+superset_dashboard_list(search="", verbose=True)
+```
+
+### ⚠️ IMPORTANT: Token Consumption Warning
+
+**ALWAYS use `verbose=False` (the default) unless absolutely necessary.**
+
+When `verbose=True` is used, the full API response with ALL fields is returned, which can be extremely large:
+- Dashboard list: Includes `json_metadata`, `position_json`, tags, roles, certification details
+- Chart list: Includes full `params` configuration, query context, form data
+- Query list: Includes complete SQL queries (no truncation)
+
+**Before using `verbose=True`, warn the user:**
+> "⚠️ Warning: Using verbose=True will return the full response with all fields, which consumes significantly more tokens (up to 20x more). This is only recommended if you need complete metadata. For most use cases, the default compact response is sufficient. Do you want to proceed with verbose=True?"
+
+**Best practice:** Always start with `verbose=False`, then use `get_by_id()` functions to fetch complete details for specific items.
+
+### Supported Endpoints
+
+| Endpoint | Default Fields (verbose=False) | Impact |
+|----------|-------------------------------|--------|
+| `superset_dashboard_list()` | id, dashboard_title, url, slug, owners, charts | ~95% smaller |
+| `superset_chart_list()` | id, slice_name, viz_type, datasource_id, datasource_name, datasource_type | ~90% smaller |
+| `superset_dataset_list()` | id, table_name, schema, database, owners | ~85% smaller |
+| `superset_database_list()` | id, database_name, backend, allow_run_async, expose_in_sqllab | ~80% smaller |
+| `superset_query_list()` | id, sql (truncated 200 chars), status, start_time, end_time, database | ~85% smaller |
+| `superset_sqllab_get_saved_queries()` | id, label, description, sql (truncated 200 chars), database | ~85% smaller |
+
+### Recommended Workflow
+
+**Discovery Pattern (Two-Tier Lookup):**
+1. **Search/List** (verbose=False): Get minimal data to find items
+   ```python
+   dashboards = superset_dashboard_list(search="sales", verbose=False)
+   # Returns: [{id: 123, dashboard_title: "Sales Dashboard", url: "...", owners: [...], charts: [...]}]
+   ```
+
+2. **Get Details** (by ID): Fetch full information for specific items
+   ```python
+   dashboard_full = superset_dashboard_get_by_id(dashboard_id=123)
+   # Returns: Complete dashboard with all metadata, json_metadata, position_json, etc.
+   ```
+
+**Or use verbose=True when you need everything:**
+```python
+dashboards_full = superset_dashboard_list(search="sales", verbose=True)
+# Returns: All fields including json_metadata, position_json, tags, roles, etc.
+```
+
+### Examples
+
+**Finding and inspecting a dashboard:**
+```python
+# 1. Search for dashboard (compact)
+results = superset_dashboard_list(search="Test dashboard", verbose=False)
+# Returns: {count: 1, ids: [8117], result: [{id: 8117, dashboard_title: "Test dashboard by 1237281", ...}]}
+
+# 2. Get specific dashboard details (full data)
+dashboard = superset_dashboard_get_by_id(dashboard_id=8117)
+# Returns: Complete dashboard with all fields
+
+# 3. Get chart details from the dashboard
+for chart in dashboard['result']['charts']:
+    chart_details = superset_chart_get_by_id(chart_id=chart['id'])
+```
+
+**Browsing all charts (with large datasets):**
+```python
+# Don't do this with verbose=True on 84K+ charts!
+charts = superset_chart_list(verbose=False)
+# Returns: Compact list of 84,117 charts with only essential fields
+
+# Then get details for specific charts
+chart_full = superset_chart_get_by_id(chart_id=85888)
+```
+
+### Technical Implementation
+- **Method**: Post-processing (Python filtering after API response)
+- **SQL Truncation**: Query SQL is truncated to 200 characters with "..." in non-verbose mode
+- **Nested Fields**: Supports nested field extraction (e.g., "database.database_name", "owners.username")
+- **Backward Compatible**: Default verbose=False provides optimal performance; set verbose=True for legacy behavior
+
+---
+
 *Reference compiled on 2025-10-19*
+*Updated on 2025-10-25 with verbose parameter documentation*
